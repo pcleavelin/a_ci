@@ -2,15 +2,11 @@ mod handlers;
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::{
-    routing::{get, post},
-};
-use tower_http::cors::CorsLayer;
+use axum::routing::{get, post};
 use reqwest::Method;
+use tower_http::cors::CorsLayer;
 
-use crate::{
-    domain::ci::interface::CiService,
-};
+use crate::domain::ci::interface::CiService;
 
 #[derive(Clone)]
 pub(crate) struct ApiState<S>
@@ -25,9 +21,7 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    pub fn new(
-        ci_service: impl CiService,
-    ) -> anyhow::Result<Self> {
+    pub fn new(ci_service: impl CiService) -> anyhow::Result<Self> {
         let state = ApiState {
             ci_service: Arc::new(ci_service),
         };
@@ -62,4 +56,5 @@ where
 {
     axum::Router::<ApiState<S>>::new()
         .route("/health", get(handlers::health))
+        .route("/repos", get(handlers::all_repos))
 }
