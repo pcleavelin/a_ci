@@ -10,7 +10,6 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
   "packageManager": "pnpm@10.20.0",
   "dependencies": {
     "astro": "^5.15.3"
