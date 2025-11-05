@@ -1,9 +1,13 @@
+pub mod write_set;
+
 use std::{
     any::{Any, TypeId},
     collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
+
+use crate::outbound::db_custom::write_set::{Diffable, Storable, Write, WriteOperation, WriteSet};
 
 #[derive(Default, Copy, Clone, PartialOrd, PartialEq, Eq, Hash, Debug)]
 struct TransactionId(u64);
@@ -29,6 +33,43 @@ impl<T> Id<T> {
     }
 }
 
+impl<T> bincode::Encode for Id<T> {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        bincode::enc::Encode::encode(&self.id, encoder)?;
+
+        Ok(())
+    }
+}
+
+impl<T, C> bincode::Decode<C> for Id<T> {
+    fn decode<D: bincode::de::Decoder<Context = C>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let id = bincode::de::Decode::decode(decoder)?;
+
+        Ok(Self {
+            id,
+            _type: PhantomData,
+        })
+    }
+}
+
+impl<'de, T, C> bincode::BorrowDecode<'de, C> for Id<T> {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = C>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let id = bincode::de::Decode::decode(decoder)?;
+
+        Ok(Self {
+            id,
+            _type: PhantomData,
+        })
+    }
+}
+
 impl<T> std::cmp::Eq for Id<T> {}
 impl<T> std::cmp::PartialEq for Id<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -41,7 +82,7 @@ impl<T> std::hash::Hash for Id<T> {
     }
 }
 
-#[derive(Default, Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, Hash, Debug, bincode::Encode, bincode::Decode)]
 struct TypelessId(u64);
 
 impl<T> From<Id<T>> for TypelessId {
@@ -66,9 +107,28 @@ impl From<u64> for TypelessId {
 pub struct Database {
     log: Vec<Transaction>,
     snapshots: HashMap<TransactionId, Snapshot>,
+    registered_types: HashMap<String, fn(&[u8]) -> Box<dyn Storable + Send>>,
 }
 
 impl Database {
+    fn register_type(
+        &mut self,
+        name: impl ToString,
+        decode_fn: fn(&[u8]) -> Box<dyn Storable + Send>,
+    ) {
+        self.registered_types.insert(name.to_string(), decode_fn);
+    }
+
+    fn decode(&self, data: &[u8]) -> Result<Box<dyn Storable + Send>, anyhow::Error> {
+        let (name, len): (String, usize) =
+            bincode::decode_from_slice(data, bincode::config::standard())
+                .expect("decode MUST succeed");
+
+        let create_storable = self.registered_types.get(&name).expect("aalkdjhfl");
+
+        Ok(create_storable(&data[len..]))
+    }
+
     fn build_snapshot(&mut self, timestamp: TransactionId) -> &Snapshot {
         let mut snapshot = Snapshot {
             timestamp,
@@ -76,26 +136,26 @@ impl Database {
         };
 
         for t in self.transactions_to(timestamp) {
-            for write in &t.write_set.0 {
+            for write in &t.write_set.writes {
                 match &write.operation {
-                    DocumentWriteOperation::New(data) => {
-                        snapshot.cached.insert(write.id, data.cloned());
+                    WriteOperation::Full(data) => {
+                        snapshot
+                            .cached
+                            .insert(write.id, self.decode(data).expect("decode MUST succeed"));
                     }
-                    DocumentWriteOperation::Modified(fields) => {
-                        match snapshot.get_typeless_mut(write.id) {
-                            Some(data) => {
-                                for field in fields {
-                                    data.write_modification(field);
-                                }
-                            }
-                            None => {
-                                panic!(
-                                    "somehow found a modified write for id {:?} at timestamp {:?} that doesn't exist in snapshot at timestamp {:?}",
-                                    write.id, t.id, snapshot.timestamp
-                                )
+                    WriteOperation::Partial(partial) => match snapshot.get_typeless_mut(write.id) {
+                        Some(data) => {
+                            for op in partial {
+                                data.apply_partial_write(op);
                             }
                         }
-                    }
+                        None => {
+                            panic!(
+                                "somehow found a partial write for id {:?} at timestamp {:?} that doesn't exist in snapshot at timestamp {:?}",
+                                write.id, t.id, snapshot.timestamp
+                            )
+                        }
+                    },
                 }
             }
         }
@@ -104,14 +164,11 @@ impl Database {
         self.snapshots.get(&timestamp).unwrap()
     }
 
-    fn transactions_to(&mut self, timestamp: TransactionId) -> impl Iterator<Item = &Transaction> {
+    fn transactions_to(&self, timestamp: TransactionId) -> impl Iterator<Item = &Transaction> {
         self.log.iter().take_while(move |t| t.id <= timestamp)
     }
 
-    fn transactions_from(
-        &mut self,
-        timestamp: TransactionId,
-    ) -> impl Iterator<Item = &Transaction> {
+    fn transactions_from(&self, timestamp: TransactionId) -> impl Iterator<Item = &Transaction> {
         self.log.iter().skip_while(move |t| t.id < timestamp)
     }
 
@@ -292,10 +349,13 @@ impl<'a> PendingTransaction<'a> {
     pub fn insert<T: Storable + Send + 'static>(&mut self, id: Id<T>, data: T) {
         // FIXME: decide on a way to generate unqiue ids
 
-        self.write_set.push(DocumentWrite::new(id.into(), data));
+        self.write_set.writes.push(Write {
+            id: id.into(),
+            operation: data.as_full_write_op(),
+        });
     }
 
-    pub fn modify<T: Storable + Send + Modifiable + Clone + 'static>(
+    pub fn modify<T: Storable + Send + Clone + 'static>(
         &mut self,
         id: Id<T>,
         transform: impl Fn(T) -> T,
@@ -305,14 +365,21 @@ impl<'a> PendingTransaction<'a> {
         let old_data = self.accessor.get(id.clone(), self.timestamp).unwrap();
         let new_data = transform(old_data.clone());
 
-        let modifications = old_data.modifications_between(&new_data);
+        let operation = old_data.as_partial_write_op(&new_data);
 
-        for modification in &modifications {
-            self.read_set.push(DocumentRead::Field(modification.field));
+        match &operation {
+            WriteOperation::Full(_) => self.read_set.push(DocumentRead::Complete),
+            WriteOperation::Partial(partial_writes) => self.read_set.0.extend(
+                partial_writes
+                    .iter()
+                    .map(|w| DocumentRead::Field(w.field_ident.clone())),
+            ),
         }
 
-        self.write_set
-            .push(DocumentWrite::modification(id, modifications));
+        self.write_set.writes.push(Write {
+            id: (&id).into(),
+            operation,
+        });
     }
 
     pub fn get<T: Storable + Clone + 'static>(&mut self, id: Id<T>) -> Option<T> {
@@ -325,7 +392,7 @@ impl<'a> PendingTransaction<'a> {
         id: Id<T>,
         field: &'static str,
     ) -> Option<Value> {
-        self.read_set.push(DocumentRead::Field(field));
+        self.read_set.push(DocumentRead::Field(field.to_string()));
         self.accessor
             .get(id, self.timestamp)
             .and_then(|data| data.field(field))
@@ -335,8 +402,6 @@ impl<'a> PendingTransaction<'a> {
 // TODO: make these actual sets?
 #[derive(Debug, Default)]
 struct ReadSet(Vec<DocumentRead>);
-#[derive(Debug, Default)]
-struct WriteSet(Vec<DocumentWrite>);
 
 impl ReadSet {
     fn push(&mut self, read: DocumentRead) {
@@ -344,15 +409,9 @@ impl ReadSet {
     }
 }
 
-impl WriteSet {
-    fn push(&mut self, write: DocumentWrite) {
-        self.0.push(write);
-    }
-}
-
 impl ReadSet {
     fn overlaps_with(&self, write_set: &WriteSet) -> bool {
-        if !write_set.0.is_empty()
+        if !write_set.writes.is_empty()
             && self
                 .0
                 .iter()
@@ -362,21 +421,21 @@ impl ReadSet {
         }
 
         let writes = write_set
-            .0
+            .writes
             .iter()
             .filter_map(|write| match &write.operation {
-                DocumentWriteOperation::New(_) => None,
-                DocumentWriteOperation::Modified(fields) => Some(fields.iter()),
+                WriteOperation::Full(_) => None,
+                WriteOperation::Partial(partial) => Some(partial.iter()),
             })
             .flatten()
-            .map(|field| field.field)
+            .map(|field| field.field_ident.as_str())
             .collect::<HashSet<_>>();
         let reads = self
             .0
             .iter()
             .filter_map(|read| match read {
                 DocumentRead::Complete => None,
-                DocumentRead::Field(field) => Some(*field),
+                DocumentRead::Field(field) => Some(field.as_ref()),
             })
             .collect::<HashSet<_>>();
 
@@ -384,65 +443,13 @@ impl ReadSet {
     }
 }
 
-pub trait Storable: Any + std::fmt::Debug {
-    fn cloned(&self) -> Box<dyn Storable + Send>;
-    fn write_modification(&mut self, field: &DocumentField);
-    fn field(&self, field: &'static str) -> Option<Value>;
-}
-pub trait Modifiable {
-    fn modifications_between(&self, other: &Self) -> Vec<DocumentField>;
-}
-
 #[derive(Debug)]
 enum DocumentRead {
     Complete,
-    Field(&'static str),
+    Field(String),
 }
 
-#[derive(Debug)]
-struct DocumentWrite {
-    id: TypelessId,
-    type_id: TypeId,
-    operation: DocumentWriteOperation,
-}
-
-impl DocumentWrite {
-    fn new<T: Storable + Send + 'static>(id: TypelessId, data: T) -> Self {
-        Self {
-            id,
-            type_id: TypeId::of::<T>(),
-            operation: DocumentWriteOperation::New(Box::new(data)),
-        }
-    }
-
-    fn modification<T: 'static>(id: Id<T>, operation: Vec<DocumentField>) -> Self {
-        Self {
-            id: id.into(),
-            type_id: TypeId::of::<T>(),
-            operation: DocumentWriteOperation::Modified(operation),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum DocumentWriteOperation {
-    New(Box<dyn Storable + Send>),
-    Modified(Vec<DocumentField>),
-}
-
-#[derive(Debug, Clone)]
-pub struct DocumentField {
-    field: &'static str,
-    value: Value,
-}
-
-impl DocumentField {
-    fn of(field: &'static str, value: Value) -> Self {
-        Self { field, value }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub enum Value {
     String(String),
     Int(i64),
@@ -472,51 +479,121 @@ impl Value {
             _ => None,
         }
     }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        bincode::encode_to_vec(self, bincode::config::standard()).expect("encode MUST succeed")
+    }
+
+    fn from_bytes(data: &[u8]) -> Self {
+        let (value, _): (Self, _) = bincode::decode_from_slice(data, bincode::config::standard())
+            .expect("decode MUST succeed");
+
+        value
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
+    use crate::outbound::db_custom::write_set::FieldDiff;
+
     use super::*;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
     struct MyTestData {
         name: Name,
         age: i64,
         contacts: HashSet<Id<Self>>,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
     struct Name {
         first: String,
         last: String,
     }
 
-    // TODO: make this a derive macro
-    impl Storable for MyTestData {
-        fn cloned(&self) -> Box<dyn Storable + Send> {
-            Box::new(self.clone())
-        }
-        fn write_modification(&mut self, field: &DocumentField) {
-            match field.field {
-                "name.first" => self.name.first = field.value.as_string().unwrap().to_string(),
-                "name.last" => self.name.last = field.value.as_string().unwrap().to_string(),
-                "age" => self.age = *field.value.as_int().unwrap(),
-                "contacts" => {
-                    self.contacts = field
-                        .value
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|id| Id::<Self>::new(id.0))
-                        .collect();
-                }
-                _ => panic!("unknown field"),
+    #[derive(bincode::Encode)]
+    struct A<T> {
+        name: String,
+        data: T,
+    }
+
+    impl<T> A<T> {
+        fn with(name: impl ToString, data: T) -> Self {
+            Self {
+                name: name.to_string(),
+                data,
             }
         }
-        fn field(&self, field: &'static str) -> Option<Value> {
-            match field {
+    }
+
+    impl Storable for MyTestData {
+        fn as_full_write_op(&self) -> WriteOperation
+        where
+            Self: Sized,
+        {
+            let data =
+                bincode::encode_to_vec(A::with("MyTestData", self), bincode::config::standard())
+                    .expect("encode MUST succeed");
+
+            WriteOperation::Full(data)
+        }
+
+        fn as_partial_write_op(&self, other: &Self) -> WriteOperation
+        where
+            Self: Sized,
+        {
+            WriteOperation::Partial(self.diff(other).into_iter().map(Into::into).collect())
+        }
+
+        fn apply_partial_write(&mut self, op: &write_set::PartialWrite) {
+            let value = Value::from_bytes(&op.data);
+            self.set_field(&op.field_ident, value);
+        }
+
+        fn set_field(&mut self, field_ident: &str, value: Value)
+        where
+            Self: Sized,
+        {
+            match field_ident {
+                "name.first" => {
+                    let Value::String(name) = value else {
+                        panic!("expected 'name.first' to be a 'String'");
+                    };
+
+                    self.name.first = name;
+                }
+                "name.last" => {
+                    let Value::String(name) = value else {
+                        panic!("expected 'name.last' to be a 'String'");
+                    };
+
+                    self.name.last = name;
+                }
+                "age" => {
+                    let Value::Int(age) = value else {
+                        panic!("expected 'age' to be a 'Int'");
+                    };
+
+                    self.age = age;
+                }
+                "contacts" => {
+                    let Value::Array(contacts) = value else {
+                        panic!("expected 'contacts' to be a 'Vec<Id>'");
+                    };
+
+                    self.contacts = contacts.into_iter().map(|id| Id::<_>::new(id.0)).collect();
+                }
+                _ => panic!("invalid field '{field_ident}'"),
+            };
+        }
+
+        fn field(&self, field_ident: &str) -> Option<Value>
+        where
+            Self: Sized,
+        {
+            match field_ident {
                 "name.first" => Some(Value::String(self.name.first.clone())),
                 "name.last" => Some(Value::String(self.name.last.clone())),
                 "age" => Some(Value::Int(self.age)),
@@ -528,32 +605,34 @@ mod tests {
         }
     }
 
-    // TODO: make this a derive macro
-    impl Modifiable for MyTestData {
-        fn modifications_between(&self, other: &Self) -> Vec<DocumentField> {
+    impl Diffable for MyTestData {
+        fn diff(&self, other: &Self) -> Vec<FieldDiff>
+        where
+            Self: Sized,
+        {
             let mut modifications = vec![];
 
             if self.name.first != other.name.first {
-                modifications.push(DocumentField::of(
+                modifications.push(FieldDiff::of(
                     "name.first",
                     Value::String(other.name.first.clone()),
                 ));
             }
 
             if self.name.last != other.name.last {
-                modifications.push(DocumentField::of(
+                modifications.push(FieldDiff::of(
                     "name.last",
                     Value::String(other.name.last.clone()),
                 ));
             }
 
             if self.age != other.age {
-                modifications.push(DocumentField::of("age", Value::Int(other.age)));
+                modifications.push(FieldDiff::of("age", Value::Int(other.age)));
             }
 
             let contacts_diff = self.contacts.difference(&other.contacts);
             if contacts_diff.count() > 0 {
-                modifications.push(DocumentField::of(
+                modifications.push(FieldDiff::of(
                     "contacts",
                     Value::Array(other.contacts.iter().map(|id| id.into()).collect()),
                 ));
@@ -565,7 +644,15 @@ mod tests {
 
     #[test]
     fn test() {
-        let db = Database::default();
+        let mut db = Database::default();
+        db.register_type("MyTestData", |data| {
+            let (data, _): (MyTestData, usize) =
+                bincode::decode_from_slice(data, bincode::config::standard())
+                    .expect("decode MUST succeed");
+
+            Box::new(data)
+        });
+
         let mut accessor = DatabaseAccessor::new(db);
 
         let data = MyTestData {
@@ -594,7 +681,7 @@ mod tests {
             );
         });
 
-        let mut cloned_accessor = accessor.clone();
+        let cloned_accessor = accessor.clone();
         let handle = std::thread::spawn(move || {
             cloned_accessor.transact(|t| {
                 let Some(Value::String(last_name_of_oldy)) =

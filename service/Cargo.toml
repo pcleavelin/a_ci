@@ -13,6 +13,7 @@ path = "src/lib/mod.rs"
 [dependencies]
 anyhow = "1.0.100"
 axum = { version = "0.6.9", features = ["headers"] }
+bincode = "2.0.1"
 dotenv = "0.15.0"
 reqwest = "0.11.14"
 serde = "1.0.152"
