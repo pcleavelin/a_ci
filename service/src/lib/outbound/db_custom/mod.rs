@@ -9,7 +9,9 @@ use std::{
 
 use crate::outbound::db_custom::write_set::{Diffable, Storable, Write, WriteOperation, WriteSet};
 
-#[derive(Default, Copy, Clone, PartialOrd, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default, Copy, Clone, PartialOrd, PartialEq, Eq, Hash, Debug, bincode::Encode, bincode::Decode,
+)]
 struct TransactionId(u64);
 
 impl From<u64> for TransactionId {
@@ -179,6 +181,9 @@ impl Database {
 
         self.log.push(Transaction::commit(timestamp, candidate));
         self.build_snapshot(timestamp);
+
+        let b = bincode::encode_to_vec(&self.log, bincode::config::standard())
+            .expect("encode MUST succeed");
     }
 }
 
@@ -262,7 +267,7 @@ impl DatabaseAccessor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, bincode::Encode, bincode::Decode)]
 struct Transaction {
     id: TransactionId,
     write_set: WriteSet,
@@ -496,21 +501,26 @@ impl Value {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::outbound::db_custom::write_set::FieldDiff;
+    use crate::{db_type, outbound::db_custom::write_set::FieldDiff};
 
     use super::*;
 
-    #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
-    struct MyTestData {
-        name: Name,
-        age: i64,
-        contacts: HashSet<Id<Self>>,
-    }
+    db_type! {
+        struct MyTestData {
+            name: Name,
+            age: i64,
+            contacts: (HashSet<Id<Self>>),
+        }
 
-    #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
-    struct Name {
-        first: String,
-        last: String,
+        struct Name {
+            first: String,
+            last: String,
+            nest: SuperNested,
+        }
+
+        struct SuperNested {
+            i_am_a_really_nested_field: i64,
+        }
     }
 
     #[derive(bincode::Encode)]
@@ -525,120 +535,6 @@ mod tests {
                 name: name.to_string(),
                 data,
             }
-        }
-    }
-
-    impl Storable for MyTestData {
-        fn as_full_write_op(&self) -> WriteOperation
-        where
-            Self: Sized,
-        {
-            let data =
-                bincode::encode_to_vec(A::with("MyTestData", self), bincode::config::standard())
-                    .expect("encode MUST succeed");
-
-            WriteOperation::Full(data)
-        }
-
-        fn as_partial_write_op(&self, other: &Self) -> WriteOperation
-        where
-            Self: Sized,
-        {
-            WriteOperation::Partial(self.diff(other).into_iter().map(Into::into).collect())
-        }
-
-        fn apply_partial_write(&mut self, op: &write_set::PartialWrite) {
-            let value = Value::from_bytes(&op.data);
-            self.set_field(&op.field_ident, value);
-        }
-
-        fn set_field(&mut self, field_ident: &str, value: Value)
-        where
-            Self: Sized,
-        {
-            match field_ident {
-                "name.first" => {
-                    let Value::String(name) = value else {
-                        panic!("expected 'name.first' to be a 'String'");
-                    };
-
-                    self.name.first = name;
-                }
-                "name.last" => {
-                    let Value::String(name) = value else {
-                        panic!("expected 'name.last' to be a 'String'");
-                    };
-
-                    self.name.last = name;
-                }
-                "age" => {
-                    let Value::Int(age) = value else {
-                        panic!("expected 'age' to be a 'Int'");
-                    };
-
-                    self.age = age;
-                }
-                "contacts" => {
-                    let Value::Array(contacts) = value else {
-                        panic!("expected 'contacts' to be a 'Vec<Id>'");
-                    };
-
-                    self.contacts = contacts.into_iter().map(|id| Id::<_>::new(id.0)).collect();
-                }
-                _ => panic!("invalid field '{field_ident}'"),
-            };
-        }
-
-        fn field(&self, field_ident: &str) -> Option<Value>
-        where
-            Self: Sized,
-        {
-            match field_ident {
-                "name.first" => Some(Value::String(self.name.first.clone())),
-                "name.last" => Some(Value::String(self.name.last.clone())),
-                "age" => Some(Value::Int(self.age)),
-                "contacts" => Some(Value::Array(
-                    self.contacts.iter().map(|id| id.into()).collect(),
-                )),
-                _ => None,
-            }
-        }
-    }
-
-    impl Diffable for MyTestData {
-        fn diff(&self, other: &Self) -> Vec<FieldDiff>
-        where
-            Self: Sized,
-        {
-            let mut modifications = vec![];
-
-            if self.name.first != other.name.first {
-                modifications.push(FieldDiff::of(
-                    "name.first",
-                    Value::String(other.name.first.clone()),
-                ));
-            }
-
-            if self.name.last != other.name.last {
-                modifications.push(FieldDiff::of(
-                    "name.last",
-                    Value::String(other.name.last.clone()),
-                ));
-            }
-
-            if self.age != other.age {
-                modifications.push(FieldDiff::of("age", Value::Int(other.age)));
-            }
-
-            let contacts_diff = self.contacts.difference(&other.contacts);
-            if contacts_diff.count() > 0 {
-                modifications.push(FieldDiff::of(
-                    "contacts",
-                    Value::Array(other.contacts.iter().map(|id| id.into()).collect()),
-                ));
-            }
-
-            modifications
         }
     }
 
@@ -659,9 +555,12 @@ mod tests {
             name: Name {
                 first: "John".to_string(),
                 last: "Doe".to_string(),
+                nest: SuperNested {
+                    i_am_a_really_nested_field: 67,
+                },
             },
             age: 42,
-            contacts: HashSet::new(),
+            contacts: vec![Id::new(1)].into_iter().collect(),
         };
 
         println!("initial state: {:#?}", accessor.db.lock().unwrap());
@@ -674,6 +573,9 @@ mod tests {
                     name: Name {
                         first: "Oldy".to_string(),
                         last: "McOlderton".to_string(),
+                        nest: SuperNested {
+                            i_am_a_really_nested_field: 32,
+                        },
                     },
                     age: 69,
                     contacts: vec![Id::new(1)].into_iter().collect(),
@@ -691,6 +593,8 @@ mod tests {
                 };
 
                 t.modify(Id::<MyTestData>::new(1), |mut data| {
+                    data.age = 9;
+                    data.name.nest.i_am_a_really_nested_field = 9;
                     data.name.last = format!("Gearbox {}", last_name_of_oldy);
                     data
                 });
@@ -700,6 +604,7 @@ mod tests {
         let id = Id::<MyTestData>::new(1);
         accessor.transact(|t| {
             t.modify(id.clone(), |mut data| {
+                data.age = 9;
                 data.name.last = "Not McOlderton Gearbox".to_string();
 
                 data
