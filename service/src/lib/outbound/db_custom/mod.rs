@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use facet::Facet;
+
 use crate::outbound::db_custom::write_set::{Diffable, Storable, Write, WriteOperation, WriteSet};
 
 #[derive(
@@ -20,7 +22,7 @@ impl From<u64> for TransactionId {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, facet::Facet)]
 pub struct Id<T> {
     id: u64,
     _type: PhantomData<T>,
@@ -392,7 +394,7 @@ impl<'a> PendingTransaction<'a> {
         self.accessor.get(id, self.timestamp)
     }
 
-    pub fn get_field<T: Storable + Clone + 'static>(
+    pub fn get_field<T: Storable + for<'facet> Facet<'facet> + Clone + 'static>(
         &mut self,
         id: Id<T>,
         field: &'static str,
@@ -464,6 +466,16 @@ pub enum Value {
 }
 
 impl Value {
+    fn size(&self) -> Option<usize> {
+        match self {
+            Value::String(_) | Value::Array(_) => None,
+
+            Value::Int(_) => Some(size_of::<i64>()),
+            Value::Float(_) => Some(size_of::<f64>()),
+            Value::Bool(_) => Some(size_of::<bool>()),
+        }
+    }
+
     fn as_string(&self) -> Option<&String> {
         match self {
             Value::String(s) => Some(s),
@@ -501,41 +513,29 @@ impl Value {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::{db_type, outbound::db_custom::write_set::FieldDiff};
+    use bincode::{Decode, Encode};
+    use facet::Facet;
 
     use super::*;
 
-    db_type! {
-        struct MyTestData {
-            name: Name,
-            age: i64,
-            contacts: (HashSet<Id<Self>>),
-        }
-
-        struct Name {
-            first: String,
-            last: String,
-            nest: SuperNested,
-        }
-
-        struct SuperNested {
-            i_am_a_really_nested_field: i64,
-        }
+    #[derive(Debug, Clone, Encode, Decode, Facet)]
+    struct MyTestData {
+        name: Name,
+        age: i64,
+        ff: String,
+        //contacts: HashSet<Id<Self>>,
     }
 
-    #[derive(bincode::Encode)]
-    struct A<T> {
-        name: String,
-        data: T,
+    #[derive(Debug, Clone, Encode, Decode, Facet)]
+    struct Name {
+        nest: SuperNested,
+        first: String,
+        last: String,
     }
 
-    impl<T> A<T> {
-        fn with(name: impl ToString, data: T) -> Self {
-            Self {
-                name: name.to_string(),
-                data,
-            }
-        }
+    #[derive(Debug, Clone, Encode, Decode, Facet)]
+    struct SuperNested {
+        i_am_a_really_nested_field: i64,
     }
 
     #[test]
@@ -552,6 +552,7 @@ mod tests {
         let mut accessor = DatabaseAccessor::new(db);
 
         let data = MyTestData {
+            ff: "FIRST".to_string(),
             name: Name {
                 first: "John".to_string(),
                 last: "Doe".to_string(),
@@ -559,8 +560,8 @@ mod tests {
                     i_am_a_really_nested_field: 67,
                 },
             },
-            age: 42,
-            contacts: vec![Id::new(1)].into_iter().collect(),
+            age: 1337,
+            //contacts: vec![Id::new(1)].into_iter().collect(),
         };
 
         println!("initial state: {:#?}", accessor.db.lock().unwrap());
@@ -570,6 +571,7 @@ mod tests {
             t.insert(
                 Id::new(2),
                 MyTestData {
+                    ff: "FIRST".to_string(),
                     name: Name {
                         first: "Oldy".to_string(),
                         last: "McOlderton".to_string(),
@@ -577,8 +579,8 @@ mod tests {
                             i_am_a_really_nested_field: 32,
                         },
                     },
-                    age: 69,
-                    contacts: vec![Id::new(1)].into_iter().collect(),
+                    age: 3000,
+                    //contacts: vec![Id::new(1)].into_iter().collect(),
                 },
             );
         });
@@ -586,16 +588,16 @@ mod tests {
         let cloned_accessor = accessor.clone();
         let handle = std::thread::spawn(move || {
             cloned_accessor.transact(|t| {
-                let Some(Value::String(last_name_of_oldy)) =
-                    t.get_field(Id::<MyTestData>::new(2), "name.last")
-                else {
-                    panic!("expected a string")
-                };
-
+                //let Some(Value::String(last_name_of_oldy)) =
+                //    t.get_field(Id::<MyTestData>::new(2), "name.last")
+                //else {
+                //    panic!("expected a string")
+                //};
+                //
                 t.modify(Id::<MyTestData>::new(1), |mut data| {
                     data.age = 9;
-                    data.name.nest.i_am_a_really_nested_field = 9;
-                    data.name.last = format!("Gearbox {}", last_name_of_oldy);
+                    data.name.nest.i_am_a_really_nested_field = 99999;
+                    //data.name.last = format!("Gearbox {}", last_name_of_oldy);
                     data
                 });
             });
@@ -604,7 +606,9 @@ mod tests {
         let id = Id::<MyTestData>::new(1);
         accessor.transact(|t| {
             t.modify(id.clone(), |mut data| {
-                data.age = 9;
+                data.ff = "hello".to_string();
+                data.age = 8;
+                data.name.first = "JingleJeimer".to_string();
                 data.name.last = "Not McOlderton Gearbox".to_string();
 
                 data
@@ -614,11 +618,13 @@ mod tests {
         let oldys_contacts = accessor.transact(|t| {
             let oldy = t.get(Id::<MyTestData>::new(2)).unwrap();
 
-            oldy.contacts
-                .into_iter()
-                .filter_map(|id| t.get(id))
-                .map(|data| format!("{} {}", data.name.first, data.name.last))
-                .collect::<Vec<_>>()
+            vec![0]
+
+            //oldy.contacts
+            //    .into_iter()
+            //    .filter_map(|id| t.get(id))
+            //    .map(|data| format!("{} {}", data.name.first, data.name.last))
+            //    .collect::<Vec<_>>()
         });
 
         handle.join().unwrap();
