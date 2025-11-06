@@ -41,7 +41,11 @@ impl Storable for DbRepository {
 }
 
 impl Diffable for DbRepository {
-    fn diff(&self, other: &Self) -> Vec<crate::outbound::db_custom::write_set::FieldDiff> {
+    fn diff(
+        &self,
+        other: &Self,
+        field_prefix: &str,
+    ) -> Vec<crate::outbound::db_custom::write_set::FieldDiff> {
         todo!()
     }
 }
@@ -89,7 +93,11 @@ impl Storable for Repository {
 }
 
 impl Diffable for Repository {
-    fn diff(&self, other: &Self) -> Vec<crate::outbound::db_custom::write_set::FieldDiff>
+    fn diff(
+        &self,
+        other: &Self,
+        field_prefix: &str,
+    ) -> Vec<crate::outbound::db_custom::write_set::FieldDiff>
     where
         Self: Sized,
     {

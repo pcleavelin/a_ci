@@ -1,15 +1,16 @@
+use std::collections::HashSet;
+
 use bincode::{Decode, Encode};
-use facet::{Facet, Field, PtrConst, Shape};
 
 use crate::outbound::db_custom::{TypelessId, Value};
 
 #[derive(bincode::Encode)]
-struct TransactionEntity<T> {
+pub struct TransactionEntity<T> {
     name: String,
     data: T,
 }
 impl<T> TransactionEntity<T> {
-    fn with(name: impl ToString, data: T) -> Self {
+    pub fn with(name: impl ToString, data: T) -> Self {
         Self {
             name: name.to_string(),
             data,
@@ -25,7 +26,7 @@ pub trait Storable: Diffable + std::fmt::Debug + std::any::Any {
     where
         Self: Sized,
     {
-        WriteOperation::Partial(self.diff(other).into_iter().map(Into::into).collect())
+        WriteOperation::Partial(self.diff(other, "").into_iter().map(Into::into).collect())
     }
 
     fn apply_partial_write(&mut self, op: &PartialWrite);
@@ -40,269 +41,14 @@ pub trait Storable: Diffable + std::fmt::Debug + std::any::Any {
 }
 
 pub trait Diffable {
-    fn diff(&self, other: &Self) -> Vec<FieldDiff>
+    fn diff(&self, other: &Self, field_prefix: &str) -> Vec<FieldDiff>
     where
         Self: Sized;
 }
 
-struct ShapeVal<'a, 's>(&'a Shape, PtrConst<'a>, &'s str);
-
-impl<'a, 's> Diffable for ShapeVal<'a, 's> {
-    fn diff(&self, other: &Self) -> Vec<FieldDiff>
-    where
-        Self: Sized,
-    {
-        let mut modifications = vec![];
-
-        let facet::Type::User(user) = self.0.ty else {
-            panic!("invalid type");
-        };
-
-        match user {
-            facet::UserType::Struct(struct_type) => {
-                //println!("{:#?}", struct_type.fields);
-
-                for field in struct_type.fields {
-                    let field_shape = field.shape();
-                    //println!("{:#?}", field_shape);
-
-                    let (self_field_ptr, other_field_ptr) = unsafe {
-                        let offset = field.offset.try_into().unwrap();
-
-                        let self_ptr: *const u8 = self.1.as_ptr();
-                        let me_field_ptr = self_ptr.offset(offset);
-
-                        let other_ptr: *const u8 = other.1.as_ptr();
-                        let other_field_ptr = other_ptr.offset(offset);
-
-                        let me = PtrConst::new(std::ptr::NonNull::new_unchecked(
-                            me_field_ptr as *mut u8,
-                        ));
-                        let other = PtrConst::new(std::ptr::NonNull::new_unchecked(
-                            other_field_ptr as *mut u8,
-                        ));
-
-                        (me, other)
-                    };
-
-                    match field_shape.def {
-                        facet::Def::Undefined => {
-                            let me = ShapeVal(
-                                field_shape,
-                                self_field_ptr,
-                                &format!("{}{}.", self.2, field.name),
-                            );
-                            let other = ShapeVal(
-                                field_shape,
-                                other_field_ptr,
-                                &format!("{}{}.", self.2, field.name),
-                            );
-
-                            modifications.extend(me.diff(&other).into_iter());
-                        }
-                        facet::Def::Scalar => {
-                            let partial_eq = field_shape.vtable.partial_eq.unwrap();
-
-                            let are_partially_eq =
-                                unsafe { partial_eq(self_field_ptr, other_field_ptr) };
-
-                            if !are_partially_eq {
-                                //println!("{:#?}", field);
-                                //println!("{:#?}", field_shape);
-                                modifications.push(FieldDiff::of(
-                                    format!("{}{}", self.2, field.name),
-                                    Value::from_field_value(other, field),
-                                ));
-                            }
-                        }
-                        facet::Def::Map(map_def) => todo!(),
-                        facet::Def::Set(set_def) => {}
-                        facet::Def::List(list_def) => todo!(),
-                        facet::Def::Array(array_def) => todo!(),
-                        facet::Def::NdArray(nd_array_def) => todo!(),
-                        facet::Def::Slice(slice_def) => todo!(),
-                        facet::Def::Option(option_def) => todo!(),
-                        facet::Def::Pointer(pointer_def) => todo!(),
-                        _ => todo!(),
-                    }
-                }
-            }
-            facet::UserType::Enum(enum_type) => todo!(),
-            facet::UserType::Union(union_type) => panic!("union types are unsupported"),
-            facet::UserType::Opaque => panic!("opaque types are invalid"),
-        }
-
-        modifications
-    }
-}
-
-impl<'a, 's> ShapeVal<'a, 's> {
-    fn set_field(&self, field_ident: &str, value: Value) {
-        let mut idents = field_ident.split(".");
-        let next = idents.next().unwrap();
-
-        let facet::Type::User(user) = self.0.ty else {
-            panic!("invalid type");
-        };
-
-        println!("next: {next}");
-
-        match user {
-            facet::UserType::Struct(struct_type) => {
-                if let Some(field) = struct_type.fields.iter().find(|f| f.name == next) {
-                    let field_shape = field.shape();
-                    match field_shape.ty {
-                        facet::Type::Primitive(primitive_type) => {
-                            let layout = field_shape
-                                .layout
-                                .sized_layout()
-                                .expect("primitive type is sized");
-                            let primitive_size = layout.size();
-                            if Some(primitive_size) != value.size() {
-                                panic!("invalid primitive size");
-                            }
-
-                            unsafe {
-                                let self_ptr = self.1.as_byte_ptr() as *mut u8;
-                                let field_ptr = self_ptr.offset(field.offset.try_into().unwrap());
-
-                                match value {
-                                    Value::String(_) | Value::Array(_) => {
-                                        panic!("String & Array are not primitive types")
-                                    }
-
-                                    Value::Int(value) => {
-                                        let r = (field_ptr as *mut i64).as_mut().unwrap();
-                                        println!("value: {value}, r before: {r}");
-                                        *r = value;
-                                        println!("r after: {r}");
-                                    }
-                                    Value::Float(value) => *(field_ptr as *mut f64) = value,
-                                    Value::Bool(value) => *(field_ptr as *mut bool) = value,
-                                }
-                            }
-                        }
-                        facet::Type::Sequence(sequence_type) => todo!(),
-                        facet::Type::User(user_type) => match user_type {
-                            facet::UserType::Struct(struct_type) => {
-                                let field_ptr = unsafe {
-                                    let self_ptr = self.1.as_byte_ptr() as *mut u8;
-                                    let field_ptr =
-                                        self_ptr.offset(field.offset.try_into().unwrap());
-
-                                    PtrConst::new(std::ptr::NonNull::new_unchecked(field_ptr))
-                                };
-                                let field_val = ShapeVal(field_shape, field_ptr, "");
-
-                                field_val.set_field(&field_ident[(field.name.len() + 1)..], value);
-                            }
-                            facet::UserType::Enum(enum_type) => todo!(),
-                            facet::UserType::Union(union_type) => todo!(),
-                            facet::UserType::Opaque if field_shape.type_identifier == "String" => {
-                                let Value::String(value) = value else {
-                                    panic!("got non-string value");
-                                };
-
-                                let field_ref = unsafe {
-                                    let self_ptr = self.1.as_byte_ptr() as *mut u8;
-                                    let field_ptr = self_ptr
-                                        .offset(field.offset.try_into().unwrap())
-                                        as *mut String;
-
-                                    field_ptr.as_mut().unwrap()
-                                };
-
-                                *field_ref = value;
-                            }
-                            facet::UserType::Opaque => panic!("unsupported type"),
-                        },
-                        facet::Type::Pointer(pointer_type) => todo!(),
-                    }
-                } else {
-                    panic!("couldn't find field: {next}");
-                }
-            }
-            facet::UserType::Enum(enum_type) => todo!(),
-            facet::UserType::Union(union_type) => panic!("union types are unsupported"),
-            facet::UserType::Opaque => panic!("opaque types are invalid"),
-        }
-    }
-}
-
-impl<T: for<'a> Facet<'a> + for<'a> FieldValueRef<'a>> Diffable for T {
-    fn diff(&self, other: &Self) -> Vec<FieldDiff>
-    where
-        Self: Sized,
-    {
-        let (me, other) = unsafe {
-            let me = ShapeVal(
-                Self::SHAPE,
-                PtrConst::new(std::ptr::NonNull::new_unchecked(
-                    self as *const _ as *mut u8,
-                )),
-                "",
-            );
-
-            let other = ShapeVal(
-                Self::SHAPE,
-                PtrConst::new(std::ptr::NonNull::new_unchecked(
-                    other as *const _ as *mut u8,
-                )),
-                "",
-            );
-
-            (me, other)
-        };
-
-        me.diff(&other)
-    }
-}
-
-impl<T: for<'a> Facet<'a> + Diffable + Encode + std::fmt::Debug> Storable for T {
-    fn as_full_write_op(&self) -> WriteOperation
-    where
-        Self: Sized,
-    {
-        let data = bincode::encode_to_vec(
-            TransactionEntity::with(Self::SHAPE.type_identifier, self),
-            bincode::config::standard(),
-        )
-        .expect("encode MUST succeed");
-
-        WriteOperation::Full(data)
-    }
-
-    fn apply_partial_write(&mut self, op: &PartialWrite) {
-        println!("{:#?}", op);
-        println!("before: {:#?}", self);
-        let value = Value::from_bytes(&op.data);
-        self.set_field(&op.field_ident, value);
-        println!("after: {:#?}", self);
-    }
-
-    fn set_field(&mut self, field_ident: &str, value: Value)
-    where
-        Self: for<'a> Facet<'a> + Sized,
-    {
-        let me = unsafe {
-            ShapeVal(
-                Self::SHAPE,
-                PtrConst::new(std::ptr::NonNull::new_unchecked(
-                    self as *const _ as *mut u8,
-                )),
-                "",
-            )
-        };
-
-        me.set_field(field_ident, value);
-    }
-
-    fn field(&self, field_ident: &str) -> Option<Value>
-    where
-        Self: for<'a> Facet<'a> + Sized,
-    {
-        None
-    }
+pub trait Valuable {
+    fn update_with_value(&mut self, field_name: &str, value: Value);
+    fn as_value(&self, field_name: &str) -> Option<Value>;
 }
 
 pub struct FieldDiff {
@@ -330,79 +76,6 @@ impl From<FieldDiff> for PartialWrite {
     }
 }
 
-trait FieldValueRef<'a> {
-    fn get_field_value_as_ref<F>(&'a self, field: &Field) -> &'a F {
-        unsafe {
-            let container_ptr = self as *const _ as *const u8;
-            let field_ptr = container_ptr.offset(field.offset.try_into().unwrap()) as *const F;
-
-            field_ptr.as_ref().unwrap()
-        }
-    }
-}
-
-impl<'a, T: Facet<'a>> FieldValueRef<'a> for T {}
-
-impl<'a, 's> FieldValueRef<'a> for ShapeVal<'a, 's> {
-    fn get_field_value_as_ref<F>(&'a self, field: &Field) -> &'a F {
-        unsafe {
-            let container_ptr: *const u8 = self.1.as_ptr();
-            let field_ptr = container_ptr.offset(field.offset.try_into().unwrap()) as *const F;
-
-            field_ptr.as_ref().unwrap()
-        }
-    }
-}
-
-impl Value {
-    fn from_field_value<'a, T: FieldValueRef<'a>>(container: &'a T, field: &Field) -> Self {
-        let shape = field.shape();
-
-        match shape.ty {
-            facet::Type::Primitive(primitive_type) => match primitive_type {
-                facet::PrimitiveType::Boolean => {
-                    Self::Bool(*container.get_field_value_as_ref(field))
-                }
-                facet::PrimitiveType::Numeric(numeric_type) => {
-                    let field_layout = field.shape().layout.sized_layout().unwrap();
-
-                    const I32_SIZE: usize = size_of::<i32>();
-                    const I64_SIZE: usize = size_of::<i64>();
-
-                    match (field_layout.size(), numeric_type) {
-                        (I32_SIZE, facet::NumericType::Integer { signed }) if signed => {
-                            Value::Int(*container.get_field_value_as_ref::<i32>(field) as i64)
-                        }
-                        (I32_SIZE, facet::NumericType::Integer { .. }) => {
-                            Value::Int(*container.get_field_value_as_ref::<u32>(field) as i64)
-                        }
-
-                        (I64_SIZE, facet::NumericType::Integer { signed }) if signed => {
-                            Value::Int(*container.get_field_value_as_ref::<u64>(field) as i64)
-                        }
-                        (I64_SIZE, facet::NumericType::Integer { .. }) => {
-                            Value::Int(*container.get_field_value_as_ref::<i64>(field) as i64)
-                        }
-                        _ => panic!("invalid numeric size"),
-                    }
-                }
-                facet::PrimitiveType::Textual(textual_type) => todo!(),
-                facet::PrimitiveType::Never => todo!(),
-            },
-
-            facet::Type::Sequence(sequence_type) => todo!(),
-            facet::Type::User(user_type) => {
-                if shape.type_identifier == "String" {
-                    Value::String(container.get_field_value_as_ref::<String>(field).clone())
-                } else {
-                    todo!("asdkjhfadsfkdasjhfdssklsadkljfkljasdhfkjlhsdfklsdkfhsd");
-                }
-            }
-            facet::Type::Pointer(pointer_type) => todo!("alkjhdfklajdhs"),
-        }
-    }
-}
-
 #[derive(Debug, Default, Encode, Decode)]
 pub struct WriteSet {
     // TODO: make an actual set
@@ -425,4 +98,204 @@ pub enum WriteOperation {
 pub struct PartialWrite {
     pub(super) field_ident: String,
     pub(super) data: Vec<u8>,
+}
+
+impl Valuable for i64 {
+    fn update_with_value(&mut self, _field_name: &str, value: Value) {
+        if let Some(value) = value.as_int() {
+            *self = *value;
+        } else {
+            panic!("value is not an i64");
+        }
+    }
+
+    fn as_value(&self, _field_name: &str) -> Option<Value> {
+        Some(Value::Int(*self))
+    }
+}
+
+impl Valuable for String {
+    fn update_with_value(&mut self, _field_name: &str, value: Value) {
+        if let Some(value) = value.as_string() {
+            *self = value.clone();
+        } else {
+            panic!("value is not a String");
+        }
+    }
+
+    fn as_value(&self, _field_name: &str) -> Option<Value> {
+        Some(Value::String(self.clone()))
+    }
+}
+
+impl<T: std::cmp::Eq + std::hash::Hash> Valuable for HashSet<T>
+where
+    T: for<'a> From<&'a TypelessId>,
+    TypelessId: for<'a> From<&'a T>,
+{
+    fn update_with_value(&mut self, _field_name: &str, value: Value) {
+        if let Some(value) = value.as_array() {
+            *self = value.iter().map(Into::into).collect();
+        } else {
+            panic!("value is not a String");
+        }
+    }
+
+    fn as_value(&self, _field_name: &str) -> Option<Value> {
+        Some(Value::Array(self.iter().map(|id| id.into()).collect()))
+    }
+}
+
+impl Diffable for i64 {
+    fn diff(&self, other: &Self, field_prefix: &str) -> Vec<FieldDiff>
+    where
+        Self: Sized,
+    {
+        if *self != *other {
+            vec![FieldDiff::of(field_prefix, Value::Int(*other))]
+        } else {
+            vec![]
+        }
+    }
+}
+
+impl Diffable for String {
+    fn diff(&self, other: &Self, field_prefix: &str) -> Vec<FieldDiff>
+    where
+        Self: Sized,
+    {
+        if *self != *other {
+            vec![FieldDiff::of(field_prefix, Value::String(other.clone()))]
+        } else {
+            vec![]
+        }
+    }
+}
+
+impl<T: std::cmp::Eq + std::hash::Hash> Diffable for HashSet<T>
+where
+    TypelessId: for<'a> From<&'a T>,
+{
+    fn diff(&self, other: &Self, field_prefix: &str) -> Vec<FieldDiff>
+    where
+        Self: Sized,
+    {
+        let diff = self.difference(other);
+        if diff.count() > 0 {
+            vec![FieldDiff::of(
+                field_prefix,
+                Value::Array(other.iter().map(|id| id.into()).collect()),
+            )]
+        } else {
+            vec![]
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! Storable {
+    derive() {
+        struct $n:ident {
+            $(
+                $field_name:ident: $field_type:ty,
+            )*
+        }
+    } => {
+        impl $crate::outbound::db_custom::write_set::Valuable for $n {
+            fn update_with_value(&mut self, field_name: &str, value: Value) {
+                self.set_field(field_name, value);
+            }
+
+            fn as_value(&self, field_name: &str) -> Option<Value> {
+                self.field(field_name)
+            }
+        }
+
+        impl Storable for $n {
+            fn as_full_write_op(&self) -> WriteOperation
+            where
+                Self: Sized
+            {
+                use $crate::outbound::db_custom::write_set::TransactionEntity;
+
+                let data =
+                    ::bincode::encode_to_vec(TransactionEntity::with(stringify!($n), self), ::bincode::config::standard())
+                        .expect("encode MUST succeed");
+
+                WriteOperation::Full(data)
+            }
+
+            fn apply_partial_write(&mut self, op: &$crate::outbound::db_custom::write_set::PartialWrite)
+            where
+                Self: Sized,
+            {
+                let value = Value::from_bytes(&op.data);
+                self.set_field(&op.field_ident, value);
+            }
+
+            fn set_field(&mut self, field_ident: &str, value: Value)
+            where
+                Self: Sized
+            {
+                use $crate::outbound::db_custom::write_set::Valuable;
+
+                let mut idents = field_ident.split(".");
+                let next = idents.next().unwrap();
+
+                match next {
+                    $(
+                        stringify!($field_name) => {
+                            self.$field_name.update_with_value(&field_ident[(next.len()+1)..], value);
+                        }
+                    ),*
+
+                    _ => panic!("set_field: invalid field '{next}'"),
+                }
+            }
+
+            fn field(&self, field_ident: &str) -> Option<Value>
+            where
+                Self: Sized
+            {
+                use $crate::outbound::db_custom::write_set::Valuable;
+
+                let mut idents = field_ident.split(".");
+                let next = idents.next().unwrap();
+
+                let nested_field_name = if next.len()+1 >= field_ident.len() {
+                    ""
+                } else {
+                    &field_ident[(next.len()+1)..]
+                };
+
+                match next {
+                    $(
+                        stringify!($field_name) => {
+                            println!("{} - {}", stringify!($field_name), field_ident);
+                            self.$field_name.as_value(nested_field_name)
+                        }
+                    ),*
+
+                    _ => panic!("set_field: invalid field '{next}'"),
+                }
+            }
+        }
+
+        impl Diffable for $n {
+            fn diff(&self, other: &Self, field_prefix: &str) -> Vec<$crate::outbound::db_custom::write_set::FieldDiff>
+            where
+                Self: Sized
+            {
+                use $crate::outbound::db_custom::write_set::Valuable;
+
+                let mut modifications = vec![];
+
+                $(
+                    modifications.extend(self.$field_name.diff(&other.$field_name, &format!("{}{}.", field_prefix, stringify!($field_name))).into_iter());
+                )*
+
+                modifications
+            }
+        }
+    };
 }
